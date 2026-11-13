@@ -6,7 +6,7 @@
 
    jobs:
      build:
-       runs-on: ubuntu-latest
+       runs-on: ubuntu-24.04
        defaults:
          run:
            working-directory: glyph-tetris
@@ -17,8 +17,6 @@
            with:
              distribution: temurin
              java-version: '17'
-
-         - uses: android-actions/setup-android@v3
 
          - name: Fetch Glyph Matrix SDK (official repo)
            run: |
