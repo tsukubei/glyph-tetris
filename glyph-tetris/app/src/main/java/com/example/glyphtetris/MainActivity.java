@@ -1,0 +1,335 @@
+package com.example.glyphtetris;
+
+import android.app.Activity;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.util.TypedValue;
+import android.view.Choreographer;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import java.util.Arrays;
+import java.util.Locale;
+
+/**
+ * 上: Glyph Matrixを模した表示(実機と同じフレームを描画) / 下: 操作ボタン。
+ * ゲームは1つのループで進み、同じフレームを「画面の模擬表示」と「実機Glyph」の両方へ渡す。
+ */
+public final class MainActivity extends Activity implements Choreographer.FrameCallback {
+
+    private static final int BG = 0xFF0B0B0D;
+    private static final int BTN_DARK = 0xFF2C2C2E;
+    private static final int BTN_BLUE = 0xFF1F6FEB;
+    private static final int BTN_RED = 0xFFD71921;
+
+    private static final long HEARTBEAT_MS = 1000;   // 変化が無くても1秒ごとに再送(消灯対策)
+    private static final long MIN_SEND_GAP_MS = 33;  // 最大およそ30fps
+
+    private GlyphBridge bridge;
+    private GlyphFrameComposer composer;
+    private TetrisEngine engine;
+
+    private GlyphPreviewView preview;
+    private TextView hud;
+    private TextView status;
+    private TextView pauseBtn;
+
+    private boolean running;
+    private long lastFrameNanos;
+    private int[] lastFrame;
+    private int[] lastSent;
+    private long lastSentMs;
+    private String lastHud = "";
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        bridge = new GlyphBridge(getApplicationContext(), new GlyphBridge.Listener() {
+            @Override
+            public void onStatus(GlyphBridge.Status s) {
+                onGlyphStatus(s);
+            }
+        });
+        int n = bridge.getMatrixLength() > 0 ? bridge.getMatrixLength() : 25;
+        composer = new GlyphFrameComposer(n);
+        engine = new TetrisEngine(composer.boardW, composer.boardH, System.nanoTime());
+
+        setContentView(buildUi(n));
+        onGlyphStatus(bridge.getStatus());
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        bridge.connect();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        running = true;
+        lastFrameNanos = 0;
+        Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    @Override
+    protected void onPause() {
+        running = false;
+        Choreographer.getInstance().removeFrameCallback(this);
+        engine.setPaused(true);
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        bridge.disconnect();
+        super.onStop();
+    }
+
+    // ------------------------------------------------------------------ ゲームループ
+
+    @Override
+    public void doFrame(long frameTimeNanos) {
+        if (!running) return;
+        long dtMs = lastFrameNanos == 0 ? 0 : (frameTimeNanos - lastFrameNanos) / 1_000_000L;
+        lastFrameNanos = frameTimeNanos;
+        if (dtMs > 100) dtMs = 100;
+
+        engine.update(dtMs);
+
+        long now = SystemClock.uptimeMillis();
+        int[] f = composer.compose(engine, now);
+        if (lastFrame == null || !Arrays.equals(f, lastFrame)) {
+            preview.setFrame(f);
+            lastFrame = f;
+        }
+
+        boolean changed = lastSent == null || !Arrays.equals(f, lastSent);
+        if ((changed && now - lastSentMs >= MIN_SEND_GAP_MS) || now - lastSentMs >= HEARTBEAT_MS) {
+            bridge.send(f);
+            lastSent = f;
+            lastSentMs = now;
+        }
+
+        refreshHud();
+        Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    private void refreshHud() {
+        String state = "";
+        if (engine.getState() == TetrisEngine.State.GAME_OVER) state = "   GAME OVER";
+        else if (engine.isPaused()) state = "   PAUSED";
+        String s = String.format(Locale.US, "SCORE %d   LINES %d   LV %d%s",
+                engine.getScore(), engine.getLines(), engine.getLevel(), state);
+        if (!s.equals(lastHud)) {
+            lastHud = s;
+            hud.setText(s);
+            pauseBtn.setText(engine.isPaused() ? "RESUME" : "PAUSE");
+        }
+    }
+
+    private void onGlyphStatus(GlyphBridge.Status s) {
+        if (status == null) return;
+        switch (s) {
+            case UNSUPPORTED:
+                status.setText("Glyph非対応の端末です(画面のみで動作)");
+                break;
+            case CONNECTING:
+                status.setText("Glyph接続中…");
+                break;
+            case READY:
+                status.setText("Glyph同期中 (" + bridge.getMatrixLength() + "×" + bridge.getMatrixLength() + ")");
+                lastSent = null; // 接続できたら直ちに最新フレームを送る
+                break;
+            default:
+                status.setText("Glyph登録に失敗(システムが古い/権限を確認)");
+                break;
+        }
+    }
+
+    // ------------------------------------------------------------------ UI構築
+
+    private View buildUi(int n) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(BG);
+        root.setPadding(dp(12), dp(8), dp(12), dp(12));
+
+        // 上: Glyph模擬ディスプレイ
+        FrameLayout top = new FrameLayout(this);
+        preview = new GlyphPreviewView(this);
+        preview.setMatrixLength(n);
+        top.addView(preview, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        root.addView(top, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 5f));
+
+        // 中: 状態表示とPAUSE/RESTART
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        status = label(12, 0xFF8E8E93);
+        hud = label(16, Color.WHITE);
+        hud.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        info.addView(status);
+        info.addView(hud);
+        bar.addView(info, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        pauseBtn = button("PAUSE", BTN_DARK, 13);
+        pauseBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.togglePause();
+            }
+        });
+        TextView restartBtn = button("RESTART", BTN_DARK, 13);
+        restartBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.reset();
+                lastFrame = null;
+            }
+        });
+        bar.addView(pauseBtn, new LinearLayout.LayoutParams(dp(92), dp(40)));
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(dp(92), dp(40));
+        rp.leftMargin = dp(8);
+        bar.addView(restartBtn, rp);
+        root.addView(bar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 下: 操作ボタン(左手: 移動と落下 / 右手: 回転とハードドロップ)
+        TextView left = button("←", BTN_DARK, 26);
+        TextView right = button("→", BTN_DARK, 26);
+        TextView soft = button("↓  SOFT", BTN_DARK, 18);
+        TextView ccw = button("↺", BTN_BLUE, 28);
+        TextView cw = button("↻", BTN_BLUE, 28);
+        TextView hard = button("⇊  DROP", BTN_RED, 18);
+
+        left.setOnTouchListener(new RepeatTouchListener(new Runnable() {
+            @Override
+            public void run() {
+                engine.moveLeft();
+            }
+        }, null, 170, 55));
+        right.setOnTouchListener(new RepeatTouchListener(new Runnable() {
+            @Override
+            public void run() {
+                engine.moveRight();
+            }
+        }, null, 170, 55));
+        soft.setOnTouchListener(new RepeatTouchListener(new Runnable() {
+            @Override
+            public void run() {
+                engine.setSoftDrop(true);
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                engine.setSoftDrop(false);
+            }
+        }, 0, 0));
+        ccw.setOnTouchListener(new RepeatTouchListener(new Runnable() {
+            @Override
+            public void run() {
+                engine.rotateCcw();
+            }
+        }, null, 0, 0));
+        cw.setOnTouchListener(new RepeatTouchListener(new Runnable() {
+            @Override
+            public void run() {
+                engine.rotateCw();
+            }
+        }, null, 0, 0));
+        hard.setOnTouchListener(new RepeatTouchListener(new Runnable() {
+            @Override
+            public void run() {
+                engine.hardDrop();
+            }
+        }, null, 0, 0));
+
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        controls.addView(half(left, right, soft), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        controls.addView(half(ccw, cw, hard), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 4f);
+        cp.topMargin = dp(8);
+        root.addView(controls, cp);
+
+        return root;
+    }
+
+    /** 上段に2ボタン(横並び)、下段に1ボタン(横幅いっぱい)。 */
+    private LinearLayout half(View a, View b, View wide) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(a, cell(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        row.addView(b, cell(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        col.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3f));
+        col.addView(wide, cell(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2f));
+        return col;
+    }
+
+    private LinearLayout.LayoutParams cell(int w, int h, float weight) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h, weight);
+        int m = dp(5);
+        p.setMargins(m, m, m, m);
+        return p;
+    }
+
+    private TextView label(int sp, int color) {
+        TextView t = new TextView(this);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTextColor(color);
+        return t;
+    }
+
+    private TextView button(String text, int color, int sp) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(Color.WHITE);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setGravity(Gravity.CENTER);
+
+        StateListDrawable states = new StateListDrawable();
+        states.addState(new int[]{android.R.attr.state_pressed}, rounded(lighten(color)));
+        states.addState(new int[]{}, rounded(color));
+        t.setBackground(states);
+        return t;
+    }
+
+    private GradientDrawable rounded(int color) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(16));
+        return g;
+    }
+
+    private static int lighten(int color) {
+        int r = Math.min(255, Color.red(color) + 55);
+        int g = Math.min(255, Color.green(color) + 55);
+        int b = Math.min(255, Color.blue(color) + 55);
+        return Color.rgb(r, g, b);
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+}
