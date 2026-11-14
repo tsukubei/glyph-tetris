@@ -23,6 +23,7 @@ import java.util.Locale;
 /**
  * 上: Glyph Matrixを模した表示(実機と同じフレームを描画) / 下: 操作ボタン。
  * ゲームは1つのループで進み、同じフレームを「画面の模擬表示」と「実機Glyph」の両方へ渡す。
+ * 起動直後は「Tap to start」を押すまで始まらない。
  */
 public final class MainActivity extends Activity implements Choreographer.FrameCallback {
 
@@ -42,6 +43,10 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
     private TextView hud;
     private TextView status;
     private TextView pauseBtn;
+    private TextView startBtn;
+
+    private boolean started;             // 「Tap to start」を押したか
+    private long gameOverStartMs = -1;    // ゲームオーバー演出の開始時刻
 
     private boolean running;
     private long lastFrameNanos;
@@ -64,6 +69,7 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
         int n = bridge.getMatrixLength() > 0 ? bridge.getMatrixLength() : 25;
         composer = new GlyphFrameComposer(n);
         engine = new TetrisEngine(composer.boardW, composer.boardH, System.nanoTime());
+        engine.setPaused(true); // 開始ボタンを押すまで動かさない
 
         setContentView(buildUi(n));
         onGlyphStatus(bridge.getStatus());
@@ -97,6 +103,17 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
         super.onStop();
     }
 
+    /** 新しいゲームを始める(Tap to start / RESTART 共通)。 */
+    private void startGame() {
+        engine.reset();
+        started = true;
+        gameOverStartMs = -1;
+        startBtn.setVisibility(View.GONE);
+        lastFrame = null;
+        lastSent = null;
+        lastHud = "";
+    }
+
     // ------------------------------------------------------------------ ゲームループ
 
     @Override
@@ -106,10 +123,22 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
         lastFrameNanos = frameTimeNanos;
         if (dtMs > 100) dtMs = 100;
 
-        engine.update(dtMs);
+        if (started) engine.update(dtMs);
 
         long now = SystemClock.uptimeMillis();
-        int[] f = composer.compose(engine, now);
+        int[] f;
+        if (started && engine.getState() == TetrisEngine.State.GAME_OVER) {
+            // ゲームオーバー: 点滅×3 → 全点灯 → 下へフェードアウト → 消灯。終わったら開始ボタンを再表示
+            if (gameOverStartMs < 0) gameOverStartMs = now;
+            long t = now - gameOverStartMs;
+            f = composer.composeGameOver(t);
+            if (t >= GlyphFrameComposer.GAME_OVER_MS && startBtn.getVisibility() != View.VISIBLE) {
+                startBtn.setVisibility(View.VISIBLE);
+            }
+        } else {
+            f = composer.compose(engine, now);
+        }
+
         if (lastFrame == null || !Arrays.equals(f, lastFrame)) {
             preview.setFrame(f);
             lastFrame = f;
@@ -128,15 +157,23 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
 
     private void refreshHud() {
         String state = "";
-        if (engine.getState() == TetrisEngine.State.GAME_OVER) state = "   GAME OVER";
-        else if (engine.isPaused()) state = "   PAUSED";
+        if (started) {
+            if (engine.getState() == TetrisEngine.State.GAME_OVER) state = "   GAME OVER";
+            else if (engine.isPaused()) state = "   PAUSED";
+        }
         String s = String.format(Locale.US, "SCORE %d   LINES %d   LV %d%s",
                 engine.getScore(), engine.getLines(), engine.getLevel(), state);
         if (!s.equals(lastHud)) {
             lastHud = s;
             hud.setText(s);
-            pauseBtn.setText(engine.isPaused() ? "RESUME" : "PAUSE");
+            pauseBtn.setText(started && engine.isPaused() ? "RESUME" : "PAUSE");
         }
+    }
+
+    private static String deviceName(int matrixLength) {
+        if (matrixLength == 25) return "Phone (3)";
+        if (matrixLength == 13) return "Phone (4a)";
+        return "Nothing Phone";
     }
 
     private void onGlyphStatus(GlyphBridge.Status s) {
@@ -149,7 +186,7 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
                 status.setText("Glyph接続中…");
                 break;
             case READY:
-                status.setText("Glyph同期中 (" + bridge.getMatrixLength() + "×" + bridge.getMatrixLength() + ")");
+                status.setText("Playing on " + deviceName(bridge.getMatrixLength()));
                 lastSent = null; // 接続できたら直ちに最新フレームを送る
                 break;
             default:
@@ -166,12 +203,23 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
         root.setBackgroundColor(BG);
         root.setPadding(dp(12), dp(8), dp(12), dp(12));
 
-        // 上: Glyph模擬ディスプレイ
+        // 上: Glyph模擬ディスプレイ(その上に大きな「Tap to start」)
         FrameLayout top = new FrameLayout(this);
         preview = new GlyphPreviewView(this);
         preview.setMatrixLength(n);
         top.addView(preview, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+
+        startBtn = button("Tap to start", BTN_RED, 30);
+        startBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startGame();
+            }
+        });
+        int startW = Math.round(getResources().getDisplayMetrics().widthPixels * 0.7f);
+        top.addView(startBtn, new FrameLayout.LayoutParams(startW, dp(96), Gravity.CENTER));
+
         root.addView(top, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 5f));
 
         // 中: 状態表示とPAUSE/RESTART
@@ -192,15 +240,14 @@ public final class MainActivity extends Activity implements Choreographer.FrameC
         pauseBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                engine.togglePause();
+                if (started) engine.togglePause();
             }
         });
         TextView restartBtn = button("RESTART", BTN_DARK, 13);
         restartBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                engine.reset();
-                lastFrame = null;
+                startGame();
             }
         });
         bar.addView(pauseBtn, new LinearLayout.LayoutParams(dp(92), dp(40)));
